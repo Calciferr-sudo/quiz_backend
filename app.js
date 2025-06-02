@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 // --- Socket.IO Server Setup ---
 const io = new Server(httpServer, {
     cors: {
-        origin: "https://github.com/Calciferr-sudo/daily_quest", // Allow all origins for development. Restrict in production to your Cloudflare Pages URL.
+        origin: "https://daily-quest.pages.dev/", // Allow all origins for development. Restrict in production to your Cloudflare Pages URL.
         methods: ["GET", "POST"]
     }
 });
