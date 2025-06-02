@@ -1,13 +1,20 @@
 {
-  "name": "daily-quiz-game-backend",
+  "name": "daily-bloom-quiz-backend",
   "version": "1.0.0",
-  "description": "Backend for Daily Quiz Game",
+  "description": "Backend for a real-time multiplayer quiz game using Node.js and Socket.IO",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
     "dev": "nodemon app.js"
   },
-  "keywords": [],
+  "keywords": [
+    "quiz",
+    "multiplayer",
+    "realtime",
+    "socket.io",
+    "node.js",
+    "gemini-api"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -15,7 +22,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "socket.io": "^4.8.1",
+    "socket.io": "^4.7.5",
     "uuid": "^9.0.1"
   },
   "devDependencies": {
