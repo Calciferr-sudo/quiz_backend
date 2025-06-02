@@ -18,7 +18,7 @@ if (!GEMINI_API_KEY) {
     process.exit(1); // Exit if API key is missing
 }
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
 
 // --- In-memory Game State (for simplicity, NOT production-ready) ---
 // In a real app, you'd use a database like MongoDB, PostgreSQL, or Redis
