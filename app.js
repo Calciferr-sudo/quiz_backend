@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 // --- Socket.IO Server Setup ---
 const io = new Server(httpServer, {
     cors: {
-        origin: "*", // Allow all origins for development. Restrict in production to your Cloudflare Pages URL.
+        origin: "https://github.com/Calciferr-sudo/daily_quest", // Allow all origins for development. Restrict in production to your Cloudflare Pages URL.
         methods: ["GET", "POST"]
     }
 });
@@ -35,7 +35,7 @@ if (!GEMINI_API_KEY) {
     process.exit(1);
 }
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-001" });
 
 
 // --- In-memory Game State (for simplicity, NOT production-ready) ---
