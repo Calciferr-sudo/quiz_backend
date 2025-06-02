@@ -13,13 +13,15 @@ const PORT = process.env.PORT || 3000;
 // --- Socket.IO Server Setup ---
 const io = new Server(httpServer, {
     cors: {
-        origin: "https://daily-quest.pages.dev/", // Allow all origins for development. Restrict in production to your Cloudflare Pages URL.
+        origin: "https://daily-quest.pages.dev", // NO TRAILING SLASH HERE
         methods: ["GET", "POST"]
     }
 });
 
 // --- Middleware ---
-app.use(cors()); // Allow cross-origin requests from your frontend
+app.use(cors({
+    origin: "https://daily-quest.pages.dev" // NO TRAILING SLASH HERE
+}));
 app.use(express.json()); // Enable parsing JSON request bodies
 
 // Serve Socket.IO client library from the backend
