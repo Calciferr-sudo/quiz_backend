@@ -22,7 +22,9 @@ const model = genAI.getGenerativeModel({ model: "gemini-pro" });
 
 // --- In-memory Game State (for simplicity, NOT production-ready) ---
 // In a real app, you'd use a database like MongoDB, PostgreSQL, or Redis
-const rooms = {}; // roomId: { hostId, users: [], status, currentQuestionIndex, questions: [], scores: {}, timerEndTime, answersReceived, difficulty }
+// room: { roomId, hostId, players: [{ id, username, score, hasAnsweredCurrentRound }],
+//         status, currentRound, maxRounds, currentQuestion, roundStartTime, answersSubmittedThisRound }
+const rooms = {};
 const users = {}; // userId: { username }
 
 // --- Helper Functions ---
@@ -30,10 +32,21 @@ function generateUniqueRoomId() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
+/**
+ * Generates a quiz question for a "list 8 items" type game using Gemini.
+ * The AI will provide a question and an array of 8 correct answers.
+ * @param {string} difficulty - 'easy', 'medium', or 'hard'.
+ * @returns {Promise<object>} - { question: string, correct_answers: string[] }
+ */
 async function generateQuizQuestion(difficulty) {
-    const prompt = `Generate a unique, daily-basis quiz question. The question should be about common everyday activities, household items, general knowledge related to daily life, or simple practical scenarios. Provide 4 options, with one correct answer.
+    const prompt = `Generate a unique, daily-basis quiz question. The question should ask the user to list exactly 8 distinct items related to a common everyday activity, household items, general knowledge related to daily life, or simple practical scenarios.
+    Provide the question and an array of exactly 8 correct answers for that question. Ensure all answers are single words or very short phrases.
     Difficulty: ${difficulty}.
-    Format the response as a JSON object with 'question', 'options' (an array of strings), and 'correct_answer' (the exact string of the correct option).`;
+    Format the response as a JSON object with two fields: 'question' (string) and 'correct_answers' (an array of exactly 8 strings). Example:
+    {
+      "question": "List 8 common fruits.",
+      "correct_answers": ["Apple", "Banana", "Orange", "Grape", "Strawberry", "Blueberry", "Pineapple", "Mango"]
+    }`;
 
     try {
         const result = await model.generateContent({
@@ -45,22 +58,29 @@ async function generateQuizQuestion(difficulty) {
         const responseText = result.response.text();
         let questionData;
         try {
+            // Attempt to parse directly, assuming AI mostly provides pure JSON due to responseMimeType
+            questionData = JSON.parse(responseText);
+        } catch (parseError) {
+            // Fallback for cases where AI might wrap in markdown fences
             const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
             if (jsonMatch && jsonMatch[1]) {
                 questionData = JSON.parse(jsonMatch[1]);
             } else {
-                questionData = JSON.parse(responseText); // Assume pure JSON
+                console.error("Failed to parse AI response JSON (no markdown or pure JSON):", responseText, parseError);
+                throw new Error("Invalid JSON from AI model. Response was: " + responseText.substring(0, 100));
             }
-        } catch (parseError) {
-            console.error("Failed to parse AI response JSON:", responseText, parseError);
-            throw new Error("Invalid JSON from AI model.");
         }
 
-        // Basic validation of AI response
-        if (!questionData.question || !Array.isArray(questionData.options) || questionData.options.length === 0 || !questionData.correct_answer) {
+        // Basic validation of AI response structure and answer count
+        if (!questionData.question || 
+            !Array.isArray(questionData.correct_answers) || 
+            questionData.correct_answers.length !== 8) {
             console.error("Malformed question data from AI:", questionData);
-            throw new Error("AI returned malformed question data.");
+            throw new Error("AI returned malformed question data or incorrect number of answers.");
         }
+
+        // Normalize correct answers to lowercase for easier comparison
+        questionData.correct_answers = questionData.correct_answers.map(ans => ans.trim().toLowerCase());
 
         return questionData;
     } catch (error) {
@@ -73,11 +93,11 @@ async function generateQuizQuestion(difficulty) {
 
 // User Authentication (Simple Anonymous Login)
 app.post('/api/auth/anonymous', (req, res) => {
-    let userId = req.headers['x-user-id'];
+    let userId = req.headers['x-user-id']; // From frontend localStorage if exists
     let username = req.headers['x-username'] || req.body.username;
 
     if (!userId || !users[userId]) {
-        userId = uuidv4();
+        userId = uuidv4(); // Generate new if not provided or doesn't exist
         users[userId] = { username: username || `Guest_${userId.substring(0, 6)}` };
     } else {
         // Update username if provided in body and different
@@ -122,14 +142,15 @@ app.post('/api/rooms/create', (req, res) => {
     rooms[roomId] = {
         roomId: roomId,
         hostId: userId,
-        users: [{ id: userId, username: username }],
-        status: 'waiting',
-        currentQuestionIndex: -1,
-        questions: [],
-        scores: { [userId]: 0 },
-        timerEndTime: null,
-        answersReceived: {},
-        difficulty: difficulty
+        players: [{ id: userId, username: username, score: 0, hasAnsweredCurrentRound: false }], // Players array with individual scores and answer status
+        status: 'waiting', // waiting, playing, finished
+        currentRound: 0, // 0-indexed round number
+        maxRounds: 5, // You can make this configurable
+        currentQuestion: null,
+        roundStartTime: null, // Timestamp when the round started
+        answersSubmittedThisRound: {}, // userId: { answers: [], score: number }
+        difficulty: difficulty,
+        playerOrder: [userId] // To maintain consistent player order for UI
     };
     res.status(201).json(rooms[roomId]);
 });
@@ -148,15 +169,19 @@ app.post('/api/rooms/join/:roomId', (req, res) => {
     if (!room) {
         return res.status(404).json({ message: 'Room not found.' });
     }
-    if (room.users.length >= 2) {
-        return res.status(400).json({ message: 'Room is full.' });
+    if (room.status !== 'waiting') {
+        return res.status(400).json({ message: 'Cannot join: Game has already started or finished.' });
     }
-    if (room.users.some(u => u.id === userId)) {
-        return res.json(room); // Already in the room, return current state
+    if (room.players.length >= 2) {
+        return res.status(400).json({ message: 'Room is full (max 2 players).' });
+    }
+    if (room.players.some(p => p.id === userId)) {
+        // If user is already in the room, just return current state
+        return res.json(room); 
     }
 
-    room.users.push({ id: userId, username: username });
-    room.scores[userId] = 0; // Initialize score for joining user
+    room.players.push({ id: userId, username: username, score: 0, hasAnsweredCurrentRound: false });
+    room.playerOrder.push(userId); // Add to player order
     res.json(room);
 });
 
@@ -167,6 +192,8 @@ app.get('/api/rooms/:roomId', (req, res) => {
     if (!room) {
         return res.status(404).json({ message: 'Room not found.' });
     }
+    // Mask sensitive info before sending to frontend if needed (e.g., correct answers)
+    // For now, we'll send everything, as the frontend needs correct answers for final display logic.
     res.json(room);
 });
 
@@ -182,7 +209,7 @@ app.post('/api/rooms/:roomId/start', async (req, res) => {
     if (room.hostId !== userId) {
         return res.status(403).json({ message: 'Only the host can start the game.' });
     }
-    if (room.users.length < 2) {
+    if (room.players.length < 2) {
         return res.status(400).json({ message: 'Need 2 players to start the game.' });
     }
     if (room.status !== 'waiting') {
@@ -190,19 +217,25 @@ app.post('/api/rooms/:roomId/start', async (req, res) => {
     }
 
     try {
-        const numQuestions = 8; // "at least 8 answers"
+        // Generate all questions at once for the game
         const generatedQuestions = [];
-        for (let i = 0; i < numQuestions; i++) {
+        for (let i = 0; i < room.maxRounds; i++) {
             const q = await generateQuizQuestion(room.difficulty);
             generatedQuestions.push(q);
         }
 
         room.status = 'playing';
-        room.currentQuestionIndex = 0;
-        room.questions = generatedQuestions;
-        room.timerEndTime = Date.now() + 15000; // 15 seconds
-        room.answersReceived = {}; // Reset for the first question
-        // Scores are already initialized when users join
+        room.currentRound = 1; // Start from round 1
+        room.currentQuestion = generatedQuestions[0]; // First question
+        room.allQuestions = generatedQuestions; // Store all generated questions
+        room.roundStartTime = Date.now(); // Start timer for the first round
+
+        // Reset player-specific round state
+        room.players.forEach(p => {
+            p.score = 0; // Reset scores at game start
+            p.hasAnsweredCurrentRound = false;
+        });
+        room.answersSubmittedThisRound = {}; // Reset for the first question
 
         res.json({ message: 'Game started!', room: room });
     } catch (error) {
@@ -211,11 +244,12 @@ app.post('/api/rooms/:roomId/start', async (req, res) => {
     }
 });
 
-// Answer Question
+// Submit Answers
 app.post('/api/rooms/:roomId/answer', (req, res) => {
     const userId = req.headers['x-user-id'];
     const roomId = req.params.roomId.toUpperCase();
-    const { questionIndex, answer } = req.body;
+    // Frontend sends 'answers' (array) and 'round' (number)
+    const { round, answers } = req.body;
 
     const room = rooms[roomId];
     if (!room) {
@@ -224,61 +258,166 @@ app.post('/api/rooms/:roomId/answer', (req, res) => {
     if (room.status !== 'playing') {
         return res.status(400).json({ message: 'Game is not in progress.' });
     }
-    if (room.currentQuestionIndex !== questionIndex) {
-        return res.status(400).json({ message: 'Not the current question.' });
+    if (room.currentRound !== round) {
+        return res.status(400).json({ message: 'Submitted answers for a past or future round.' });
     }
-    if (room.answersReceived[userId] !== undefined) {
-        return res.status(400).json({ message: 'You have already answered this question.' });
+    // Find the player in the room's players array
+    const player = room.players.find(p => p.id === userId);
+    if (!player) {
+        return res.status(401).json({ message: 'You are not a player in this room.' });
+    }
+    if (player.hasAnsweredCurrentRound) {
+        return res.status(400).json({ message: 'You have already submitted answers for this round.' });
+    }
+    if (!Array.isArray(answers) || answers.length !== 8) {
+        return res.status(400).json({ message: 'Answers must be an array of exactly 8 items.' });
     }
 
-    const currentQuestion = room.questions[room.currentQuestionIndex];
-    if (!currentQuestion) {
-        return res.status(500).json({ message: 'Current question data is missing.' });
+    const currentQuestion = room.currentQuestion;
+    if (!currentQuestion || !currentQuestion.correct_answers) {
+        return res.status(500).json({ message: 'Current question data is missing or malformed.' });
     }
 
-    room.answersReceived[userId] = answer;
+    let scoreEarnedThisRound = 0;
+    const correctAnswersSet = new Set(currentQuestion.correct_answers.map(a => a.trim().toLowerCase())); // Ensure correct answers are normalized
 
-    // Logic for "first user to answer gets the point"
-    const answeredUsers = Object.keys(room.answersReceived);
-    if (answer === currentQuestion.correct_answer) {
-        // If this user is the *first* to answer correctly
-        const correctAnswersCount = Object.values(room.answersReceived).filter(a => a === currentQuestion.correct_answer).length;
-
-        // This check is a simple way to approximate "first correct answer" for an in-memory game.
-        // A more robust solution for competitive play would involve timestamps or locking.
-        if (correctAnswersCount === 1) { // If this is the first correct answer received for this question
-            room.scores[userId] = (room.scores[userId] || 0) + 1;
+    // Compare submitted answers to correct answers
+    const submittedNormalized = answers.map(ans => ans.trim().toLowerCase());
+    submittedNormalized.forEach(submittedAns => {
+        if (correctAnswersSet.has(submittedAns)) {
+            scoreEarnedThisRound++;
+            correctAnswersSet.delete(submittedAns); // Prevent double counting for duplicate submissions that match
         }
-    }
+    });
 
-    // After all players (2) have answered or timer expires (handled by polling on frontend), move to next question.
-    // The client-side polling will detect updates to answersReceived and trigger next question logic if host.
-    res.json({ message: 'Answer received', room: room });
+    // Update player's score
+    player.score += scoreEarnedThisRound;
+    player.hasAnsweredCurrentRound = true; // Mark player as having answered this round
+
+    // Store submitted answers for review or other logic
+    room.answersSubmittedThisRound[userId] = {
+        answers: submittedNormalized,
+        score: scoreEarnedThisRound
+    };
+
+    // Check if all players have answered
+    const allPlayersAnswered = room.players.every(p => p.hasAnsweredCurrentRound);
+
+    // If all players have answered or time is up (backend handles actual timer/state progression)
+    // For now, let the frontend polling trigger next round.
+    res.json({ message: 'Answers received and scored.', room: room, scoreEarned: scoreEarnedThisRound });
 });
 
 
-// Move to next question (only host should trigger this or timer)
-app.post('/api/rooms/:roomId/next-question', (req, res) => {
+// Advance to the next round / End Game
+// This endpoint should be called by the host client after answers are in or time runs out,
+// or an internal backend timer could trigger it.
+app.post('/api/rooms/:roomId/next-round', (req, res) => {
     const userId = req.headers['x-user-id'];
     const roomId = req.params.roomId.toUpperCase();
     const room = rooms[roomId];
 
-    if (!room) return res.status(404).json({ message: 'Room not found.' });
-    // This endpoint should ideally only be triggered by the host or an automated timer mechanism
-    // For simplicity, we'll let the frontend polling mechanism manage transitions after answers/timer.
-    // The /api/rooms/:roomId/answer endpoint already updates room.answersReceived and scores.
-    // The frontend host logic will call this when needed.
+    if (!room) {
+        return res.status(404).json({ message: 'Room not found.' });
+    }
+    // Only host can trigger this, or make it an internal server mechanism.
+    if (room.hostId !== userId) {
+        return res.status(403).json({ message: 'Only the host can advance rounds.' });
+    }
+    if (room.status !== 'playing') {
+        return res.status(400).json({ message: 'Game is not in progress.' });
+    }
 
-    const nextQuestionIndex = room.currentQuestionIndex + 1;
-    if (nextQuestionIndex < room.questions.length) {
-        room.currentQuestionIndex = nextQuestionIndex;
-        room.timerEndTime = Date.now() + 15000; // Reset timer for new question
-        room.answersReceived = {}; // Reset answers for the new question
-        res.json({ message: 'Moved to next question', room: room });
+    // Check if enough time has passed or all players have answered
+    // (This logic could be more robust, e.g., checking timestamps or player submission flags)
+    const allPlayersAnswered = room.players.every(p => p.hasAnsweredCurrentRound);
+    const timeElapsed = (Date.now() - room.roundStartTime) >= (15000); // 15 seconds round duration
+    
+    // Only proceed if round criteria met
+    if (!allPlayersAnswered && !timeElapsed) {
+         return res.status(400).json({ message: 'Not all players have answered and time has not elapsed.' });
+    }
+
+    const nextRound = room.currentRound + 1;
+
+    if (nextRound <= room.maxRounds) {
+        // Move to next round
+        room.currentRound = nextRound;
+        room.currentQuestion = room.allQuestions[nextRound - 1]; // Get next question
+        room.roundStartTime = Date.now(); // Reset timer for new round
+        
+        // Reset player-specific round state for the new round
+        room.players.forEach(p => {
+            p.hasAnsweredCurrentRound = false;
+        });
+        room.answersSubmittedThisRound = {}; // Clear submitted answers for this round
+
+        res.json({ message: `Moved to round ${nextRound}`, room: room });
     } else {
+        // Game finished
         room.status = 'finished';
+        room.currentQuestion = null; // Clear question
+        room.roundStartTime = null; // Clear timer
         res.json({ message: 'Game finished', room: room });
     }
+});
+
+// Leave Room
+app.post('/api/rooms/:roomId/leave', (req, res) => {
+    const userId = req.headers['x-user-id'];
+    const roomId = req.params.roomId.toUpperCase();
+    const room = rooms[roomId];
+
+    if (!room) {
+        return res.status(404).json({ message: 'Room not found.' });
+    }
+
+    const playerIndex = room.players.findIndex(p => p.id === userId);
+    if (playerIndex === -1) {
+        return res.status(400).json({ message: 'You are not in this room.' });
+    }
+
+    room.players.splice(playerIndex, 1); // Remove player
+    room.playerOrder = room.playerOrder.filter(id => id !== userId); // Remove from order
+
+    // If host leaves, delete room or assign new host
+    if (room.hostId === userId) {
+        if (room.players.length > 0) {
+            // Assign new host to the next player in line
+            room.hostId = room.players[0].id;
+            console.log(`Host ${userId} left. New host is ${room.hostId}`);
+            // If game was playing and now only one player is left, end the game
+            if (room.status === 'playing' && room.players.length < 2) {
+                room.status = 'finished';
+                room.currentQuestion = null;
+                room.roundStartTime = null;
+                console.log(`Game ${roomId} ended because only one player remains.`);
+                return res.json({ message: 'Left room, new host assigned, game ended as players < 2.', room: room });
+            }
+        } else {
+            // No players left, delete the room
+            delete rooms[roomId];
+            console.log(`Room ${roomId} deleted as host left and no players remain.`);
+            return res.json({ message: 'Room deleted.', room: null });
+        }
+    }
+
+    // If a non-host player leaves and game is playing and now only one player is left
+    if (room.status === 'playing' && room.players.length < 2) {
+        room.status = 'finished';
+        room.currentQuestion = null;
+        room.roundStartTime = null;
+        console.log(`Game ${roomId} ended because only one player remains after ${userId} left.`);
+    }
+    
+    // If no players left after someone leaves, delete the room
+    if (room.players.length === 0) {
+        delete rooms[roomId];
+        console.log(`Room ${roomId} deleted as last player left.`);
+        return res.json({ message: 'Left room, room deleted.', room: null });
+    }
+
+    res.json({ message: 'Left room successfully', room: room });
 });
 
 
