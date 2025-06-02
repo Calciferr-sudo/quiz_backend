@@ -25,7 +25,6 @@ app.use(cors({
 app.use(express.json()); // Enable parsing JSON request bodies
 
 // Serve Socket.IO client library from the backend (if needed, though frontend usually fetches from CDN)
-// This line might not be strictly necessary if your frontend links to a CDN for socket.io-client
 app.use('/socket.io', express.static(__dirname + '/node_modules/socket.io-client/dist'));
 
 // --- Gemini API Setup ---
@@ -35,12 +34,9 @@ if (!GEMINI_API_KEY) {
     process.exit(1); // Exit if API key is missing
 }
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-// IMPORTANT: Ensure you are using a currently available and recommended model
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-001" }); 
-// You can also try "gemini-1.5-flash" if "gemini-2.0-flash-001" has issues.
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-001" });
 
 // --- In-memory Game State (for simplicity, NOT production-ready) ---
-// In a real app, you'd use a database like MongoDB, PostgreSQL, or Redis
 const rooms = {}; // roomId: { hostId, users: [], status, currentQuestionIndex, questions: [], scores: {}, timerEndTime, answersReceived, difficulty }
 const users = {}; // userId: { username }
 
@@ -50,7 +46,9 @@ function generateUniqueRoomId() {
 }
 
 async function generateQuizQuestions(difficulty = 'easy') {
-    const prompt = `Generate 5 multiple-choice quiz questions about general knowledge, each with 4 answer options (one correct, three incorrect). The questions should be suitable for a ${difficulty} difficulty level. Ensure the correct answer is always unique among the options and strictly provide the output as a JSON array of objects.
+    // Add a random string to the prompt to encourage more diverse outputs
+    const uniqueifier = Math.random().toString(36).substring(2, 7);
+    const prompt = `Generate 5 multiple-choice quiz questions about general knowledge, each with 4 answer options (one correct, three incorrect). The questions should be suitable for a ${difficulty} difficulty level. Ensure the correct answer is always unique among the options and strictly provide the output as a JSON array of objects. Include diverse topics. (Request ID: ${uniqueifier})
 
     Example format:
     [
@@ -117,14 +115,8 @@ async function generateQuizQuestions(difficulty = 'easy') {
 function emitRoomState(roomId) {
     const room = rooms[roomId];
     if (room) {
-        // Create a copy of the room state to avoid sending sensitive data or modifying original
         const roomStateToSend = { ...room };
-        // Remove individual player sockets info if any from the state sent to clients
-        delete roomStateToSend.sockets; 
-
-        // Mask correct answers if the game is in progress and sending to non-host players
-        // (You might already handle this on the frontend or decide not to send correct answer until round end)
-        // For now, we'll send everything as is, rely on frontend to only display what's needed.
+        delete roomStateToSend.sockets;
 
         io.to(roomId).emit('roomState', roomStateToSend);
         console.log(`Emitted roomUpdate for room ${roomId}. Current state:`, roomStateToSend);
@@ -156,19 +148,19 @@ app.post('/api/rooms', async (req, res) => {
     }
 
     const roomId = generateUniqueRoomId();
-    const questions = await generateQuizQuestions(difficulty); // Generate questions on room creation
+    const questions = await generateQuizQuestions(difficulty);
 
     rooms[roomId] = {
         roomId,
         hostId,
         players: [{ id: hostId, username: username, score: 0, hasAnsweredCurrentRound: false }],
-        status: 'waiting', // waiting, playing, finished
+        status: 'waiting',
         currentRound: 0,
-        maxRounds: questions.length > 0 ? questions.length : 5, // Max rounds based on generated questions
-        currentQuestionIndex: -1, // -1 before game starts
+        maxRounds: questions.length > 0 ? questions.length : 5,
+        currentQuestionIndex: -1,
         questions: questions,
         roundStartTime: null,
-        answersReceived: {}, // userId: answer
+        answersReceived: {},
         difficulty: difficulty || 'easy'
     };
 
@@ -182,7 +174,7 @@ app.post('/api/rooms/join', (req, res) => {
     const userId = req.headers['x-user-id'];
     const username = req.headers['x-username'];
     const { roomId: requestedRoomId } = req.body;
-    const roomId = requestedRoomId.toUpperCase(); // Ensure uppercase
+    const roomId = requestedRoomId.toUpperCase();
 
     if (!userId || !username) {
         return res.status(401).json({ message: 'Authentication required to join a room.' });
@@ -197,12 +189,10 @@ app.post('/api/rooms/join', (req, res) => {
         return res.status(400).json({ message: 'Cannot join: Game has already started or finished in this room.' });
     }
 
-    // Check if player is already in the room
     if (room.players.some(p => p.id === userId)) {
         return res.status(200).json({ message: 'Already in room.', roomId });
     }
 
-    // Add player to room
     room.players.push({ id: userId, username: username, score: 0, hasAnsweredCurrentRound: false });
     console.log(`User ${username} (${userId}) joined room ${roomId}.`);
     emitRoomState(roomId);
@@ -216,7 +206,10 @@ app.post('/api/rooms/:roomId/leave', (req, res) => {
     const room = rooms[roomId];
 
     if (!room) {
-        return res.status(404).json({ message: 'Room not found.' });
+        // If room not found, it's already gone or never existed.
+        // This is fine, just confirm to the client.
+        console.log(`Attempted to leave room ${roomId} but it was not found on server.`);
+        return res.status(200).json({ message: 'Room already left or does not exist.' });
     }
 
     const initialPlayerCount = room.players.length;
@@ -230,21 +223,20 @@ app.post('/api/rooms/:roomId/leave', (req, res) => {
             console.log(`Room ${roomId} deleted as all players left.`);
             io.to(roomId).emit('roomDeleted', { roomId: roomId, message: 'Room deleted as all players left.' });
         } else {
-            // If the host left, assign a new host
             if (room.hostId === userId) {
                 room.hostId = room.players[0] ? room.players[0].id : null;
                 console.log(`Host ${userId} left. New host for room ${roomId}: ${room.hostId}`);
             }
-            // If game was playing and now only one player remains, end the game
             if (room.status === 'playing' && room.players.length < 2) {
                 room.status = 'finished';
                 console.log(`Game in room ${roomId} ended due to player disconnect, only one player remains.`);
             }
-            emitRoomState(roomId); // Broadcast updated room state
+            emitRoomState(roomId);
         }
         res.json({ message: 'Left room successfully!' });
     } else {
-        res.status(400).json({ message: 'User not found in this room.' });
+        // User was not found in the room's player list
+        res.status(400).json({ message: 'You are not in this room.' });
     }
 });
 
@@ -263,10 +255,10 @@ app.post('/api/rooms/:roomId/start', (req, res) => {
 
     room.status = 'playing';
     room.currentRound = 1;
-    room.currentQuestionIndex = 0; // Start with the first question
-    room.roundStartTime = Date.now() + 3000; // Give 3 seconds countdown before timer starts (for frontend sync)
-    room.answersReceived = {}; // Reset for the first question
-    room.players.forEach(p => p.hasAnsweredCurrentRound = false); // Reset answer status for all players
+    room.currentQuestionIndex = 0;
+    room.roundStartTime = Date.now() + 3000;
+    room.answersReceived = {};
+    room.players.forEach(p => p.hasAnsweredCurrentRound = false);
 
     console.log(`Game started in room ${roomId}. First question displayed.`);
     emitRoomState(roomId);
@@ -293,26 +285,21 @@ app.post('/api/rooms/:roomId/answer', (req, res) => {
     room.answersReceived[userId] = answer;
     player.hasAnsweredCurrentRound = true;
 
-    // Check if the answer is correct and update score
     if (answer === currentQuestion.correctAnswer) {
-        player.score = (player.score || 0) + 1; // Assuming 1 point per correct answer
+        player.score = (player.score || 0) + 1;
         console.log(`Player ${player.username} answered correctly. Score: ${player.score}`);
     } else {
         console.log(`Player ${player.username} answered incorrectly. Correct was: ${currentQuestion.correctAnswer}`);
     }
 
-    emitRoomState(roomId); // Emit update after answer received
+    emitRoomState(roomId);
 
-    // If all players have answered or timer is up, move to next question/round end
-    // This logic can be more robust, potentially handled by a server-side timer or host action
     const allPlayersAnswered = room.players.every(p => p.hasAnsweredCurrentRound);
     if (allPlayersAnswered) {
         console.log(`All players in room ${roomId} have answered. Preparing for next round.`);
-        
-        // Short delay before moving to next question to allow frontend to show answers
         setTimeout(() => {
             moveToNextQuestion(roomId);
-        }, 3000); // Wait 3 seconds
+        }, 3000);
     }
 
     res.json({ message: 'Answer received', room: room });
@@ -327,17 +314,16 @@ function moveToNextQuestion(roomId) {
     if (nextQuestionIndex < room.questions.length && room.currentRound < room.maxRounds) {
         room.currentQuestionIndex = nextQuestionIndex;
         room.currentRound++;
-        room.roundStartTime = Date.now() + 3000; // Reset timer for new question (with 3s countdown)
-        room.answersReceived = {}; // Reset answers for the new question
-        room.players.forEach(p => p.hasAnsweredCurrentRound = false); // Reset answer status for all players
+        room.roundStartTime = Date.now() + 3000;
+        room.answersReceived = {};
+        room.players.forEach(p => p.hasAnsweredCurrentRound = false);
         console.log(`Moved to question ${room.currentQuestionIndex + 1} in room ${roomId}.`);
         emitRoomState(roomId);
     } else {
-        // Game finished
         room.status = 'finished';
-        room.roundStartTime = null; // Clear timer
+        room.roundStartTime = null;
         console.log(`Game finished in room ${roomId}.`);
-        emitRoomState(roomId); // Emit final state
+        emitRoomState(roomId);
     }
 }
 
@@ -351,54 +337,51 @@ io.on('connection', (socket) => {
         if (room) {
             socket.join(roomId);
             console.log(`${userId} joined Socket.IO room: ${roomId}`);
-            // Ensure player is actually in the room's data structure
-            if (!room.players.some(p => p.id === userId)) {
-                 // This case should ideally not happen if /api/rooms/join was used first,
-                 // but as a fallback, add player to room if socket joins directly.
-                const username = users[userId]?.username || `Guest-${userId.substring(0,4)}`;
-                room.players.push({ id: userId, username: username, score: 0, hasAnsweredCurrentRound: false });
-                console.log(`Added missing player ${username} to room data for ${roomId}`);
-                emitRoomState(roomId); // Emit update if player was added
+            // Update the socket.id in the room's player list if it's different from the userId
+            // This is crucial for disconnect logic to work correctly with the actual socket.id
+            const playerInRoom = room.players.find(p => p.id === userId);
+            if (playerInRoom) {
+                // If the player exists, update their socket ID to the current one
+                // This handles cases where a user reconnects with a new socket.id but same userId
+                playerInRoom.socketId = socket.id; // Store socket.id for disconnect tracking
             } else {
-                emitRoomState(roomId); // Just emit current state if already in room
+                // This case should ideally not happen if /api/rooms/join was used first,
+                // but as a fallback, add player to room if socket joins directly.
+                const username = users[userId]?.username || `Guest-${userId.substring(0,4)}`;
+                room.players.push({ id: userId, username: username, score: 0, hasAnsweredCurrentRound: false, socketId: socket.id });
+                console.log(`Added missing player ${username} to room data for ${roomId}`);
             }
+            emitRoomState(roomId);
         } else {
-            // If room doesn't exist on server, inform client
             socket.emit('roomDeleted', { roomId: roomId, message: 'Room does not exist or was deleted.' });
         }
     });
 
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
-        // Find which room the disconnected socket was in
         for (const roomId in rooms) {
             const room = rooms[roomId];
-            const playerIndex = room.players.findIndex(p => p.id === socket.id); // Assuming socket.id is stored as userId in players
+            // Find player by socket.id now, as userId might persist across reconnections
+            const playerIndex = room.players.findIndex(p => p.socketId === socket.id);
             if (playerIndex !== -1) {
-                const disconnectedUserId = room.players[playerIndex].id; // Get the actual userId from the room's player list
+                const disconnectedPlayer = room.players[playerIndex];
+                console.log(`User ${disconnectedPlayer.username || disconnectedPlayer.id} disconnected from room ${roomId}. Removing.`);
+                room.players.splice(playerIndex, 1);
 
-                if (playerIndex !== -1) {
-                    // For simplicity, if a player disconnects, they are considered to have left the room.
-                    console.log(`User ${users[disconnectedUserId]?.username || disconnectedUserId} disconnected from room ${roomId}. Removing.`);
-                    room.players.splice(playerIndex, 1); // Remove player from room
-
-                    if (room.players.length === 0) {
-                        delete rooms[roomId];
-                        console.log(`Room ${roomId} deleted as all players left on disconnect.`);
-                        io.to(roomId).emit('roomDeleted', { roomId: roomId, message: 'Room deleted due to disconnects.' });
-                    } else {
-                        // If host disconnected, assign new host
-                        if (room.hostId === disconnectedUserId) {
-                            room.hostId = room.players[0] ? room.players[0].id : null;
-                            console.log(`Host ${disconnectedUserId} disconnected. New host for room ${roomId}: ${room.hostId}`);
-                        }
-                        // If game was playing and now only one player remains, end the game
-                        if (room.status === 'playing' && room.players.length < 2) {
-                            room.status = 'finished'; // End game if opponent disconnects
-                            console.log(`Game in room ${roomId} ended due to player disconnect, only one player remains.`);
-                        }
-                        emitRoomState(roomId); // Broadcast updated room state to remaining players
+                if (room.players.length === 0) {
+                    delete rooms[roomId];
+                    console.log(`Room ${roomId} deleted as all players left on disconnect.`);
+                    // No need to emit to room, as it's empty. Rely on client-side roomDeleted event.
+                } else {
+                    if (room.hostId === disconnectedPlayer.id) {
+                        room.hostId = room.players[0] ? room.players[0].id : null;
+                        console.log(`Host ${disconnectedPlayer.id} disconnected. New host for room ${roomId}: ${room.hostId}`);
                     }
+                    if (room.status === 'playing' && room.players.length < 2) {
+                        room.status = 'finished';
+                        console.log(`Game in room ${roomId} ended due to player disconnect, only one player remains.`);
+                    }
+                    emitRoomState(roomId);
                 }
             }
         }
